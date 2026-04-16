@@ -1,0 +1,21 @@
+{
+  "name": "songcraft-backend",
+  "version": "1.0.0",
+  "description": "SongCraft4You Backend API - Anthropic Claude Proxy",
+  "main": "api/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node api/index.js",
+    "dev": "node --watch api/index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "@anthropic-ai/sdk": "^0.20.0",
+    "@supabase/supabase-js": "^2.38.0",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": "18.x"
+  }
+}
