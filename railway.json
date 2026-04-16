@@ -1,0 +1,14 @@
+{
+  "name": "songcraft-backend",
+  "description": "SongCraft4You Backend API - Anthropic Claude Proxy",
+  "keywords": ["nodejs", "anthropic", "api"],
+  "env": {
+    "ANTHROPIC_API_KEY": {
+      "description": "Anthropic API Key for Claude",
+      "required": true
+    },
+    "NODE_ENV": {
+      "value": "production"
+    }
+  }
+}
