@@ -138,6 +138,40 @@ app.post('/api/generate-lyrics', async (req, res) => {
   }
 });
 
+// Generic generate endpoint (proxies to Anthropic)
+app.post('/api/generate', async (req, res) => {
+  try {
+    const { model, max_tokens, messages } = req.body;
+
+    if (!messages || !Array.isArray(messages)) {
+      return res.status(400).json({ error: 'messages array is required' });
+    }
+
+    const message = await anthropic.messages.create({
+      model: model || 'claude-sonnet-4-20250514',
+      max_tokens: max_tokens || 8000,
+      messages,
+    });
+
+    const content = message.content.map(c => c.text || '').join('');
+
+    res.json({
+      success: true,
+      content: [{ type: 'text', text: content }],
+      usage: {
+        input_tokens: message.usage.input_tokens,
+        output_tokens: message.usage.output_tokens,
+      },
+    });
+  } catch (error) {
+    console.error('Error in generate endpoint:', error);
+    res.status(500).json({
+      error: 'Failed to generate',
+      details: error.message,
+    });
+  }
+});
+
 // Generic message endpoint for future extensibility
 app.post('/api/message', async (req, res) => {
   try {
