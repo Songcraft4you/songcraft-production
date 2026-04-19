@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
+import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
+import { createClient } from '@supabase/supabase-js';
 import dotenv from 'dotenv';
 
 dotenv.config();
@@ -13,8 +15,24 @@ const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// Initialize Supabase with Service Role Key (admin access, bypasses RLS)
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
+// Lemon Squeezy Plan Mapping: Variant ID -> plan_level
+const PLAN_MAP = {
+  '1495187': 1,  // Genesis — Standard Plan
+  '1495203': 2,  // Studio Elite Plan
+};
+
 // Middleware
 app.use(cors());
+
+// IMPORTANT: Raw body needed for Lemon Squeezy signature verification
+// Must be registered BEFORE express.json()
+app.use('/api/lemon-webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 
 // Health check endpoint
@@ -22,7 +40,105 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Song ideas generation endpoint
+// ============================================================================
+// LEMON SQUEEZY WEBHOOK
+// ============================================================================
+app.post('/api/lemon-webhook', async (req, res) => {
+  try {
+    // Verify signature
+    const signature = req.headers['x-signature'];
+    const rawBody = req.body; // Buffer (raw body)
+
+    if (!signature) {
+      console.error('Missing x-signature header');
+      return res.status(401).json({ error: 'Missing signature' });
+    }
+
+    const hmac = crypto.createHmac('sha256', process.env.LEMON_SQUEEZY_WEBHOOK_SECRET);
+    const digest = hmac.update(rawBody).digest('hex');
+
+    const isValid = crypto.timingSafeEqual(
+      Buffer.from(digest, 'hex'),
+      Buffer.from(signature, 'hex')
+    );
+
+    if (!isValid) {
+      console.error('Invalid webhook signature');
+      return res.status(401).json({ error: 'Invalid signature' });
+    }
+
+    // Parse the body
+    const event = JSON.parse(rawBody.toString());
+    const eventName = event.meta?.event_name;
+    const data = event.data?.attributes;
+
+    console.log(`📩 Lemon Squeezy Event: ${eventName}`);
+
+    // --- SUBSCRIPTION CREATED or ORDER CREATED ---
+    if (eventName === 'subscription_created' || eventName === 'order_created') {
+      const email = data?.user_email;
+      const variantId = String(data?.variant_id || data?.first_order_item?.variant_id);
+      const lemonSqueezyId = String(event.data?.id);
+      const planLevel = PLAN_MAP[variantId];
+
+      if (!email) {
+        return res.status(400).json({ error: 'No email in payload' });
+      }
+
+      if (planLevel === undefined) {
+        console.warn(`⚠️ Unknown variant ID: ${variantId}`);
+        return res.status(200).json({ message: 'Unknown variant, skipped.' });
+      }
+
+      // Update user profile in Supabase
+      const { error: updateError } = await supabase
+        .from('profiles')
+        .update({ plan_level: planLevel, lemon_squeezy_id: lemonSqueezyId })
+        .eq('email', email);
+
+      if (updateError) {
+        console.error('Supabase update error:', updateError);
+        return res.status(500).json({ error: 'Database update failed' });
+      }
+
+      console.log(`✅ User ${email} upgraded to plan_level ${planLevel}`);
+      return res.status(200).json({ success: true, email, planLevel });
+    }
+
+    // --- SUBSCRIPTION CANCELLED or EXPIRED ---
+    if (eventName === 'subscription_cancelled' || eventName === 'subscription_expired') {
+      const email = data?.user_email;
+
+      if (!email) {
+        return res.status(400).json({ error: 'No email in payload' });
+      }
+
+      const { error: downgradeError } = await supabase
+        .from('profiles')
+        .update({ plan_level: 0, lemon_squeezy_id: null })
+        .eq('email', email);
+
+      if (downgradeError) {
+        console.error('Supabase downgrade error:', downgradeError);
+        return res.status(500).json({ error: 'Database downgrade failed' });
+      }
+
+      console.log(`⬇️ User ${email} downgraded to plan_level 0 (Explorer)`);
+      return res.status(200).json({ success: true, email, planLevel: 0 });
+    }
+
+    // All other events — acknowledge
+    return res.status(200).json({ message: `Event ${eventName} acknowledged.` });
+
+  } catch (err) {
+    console.error('Webhook handler error:', err);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// SONG IDEAS GENERATION
+// ============================================================================
 app.post('/api/generate-ideas', async (req, res) => {
   try {
     const { genre, mood, language = 'de' } = req.body;
@@ -48,12 +164,7 @@ app.post('/api/generate-ideas', async (req, res) => {
     const message = await anthropic.messages.create({
       model: 'claude-opus-4-1',
       max_tokens: 1024,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const content = message.content[0].type === 'text' ? message.content[0].text : '';
@@ -68,14 +179,13 @@ app.post('/api/generate-ideas', async (req, res) => {
     });
   } catch (error) {
     console.error('Error generating ideas:', error);
-    res.status(500).json({
-      error: 'Failed to generate ideas',
-      details: error.message,
-    });
+    res.status(500).json({ error: 'Failed to generate ideas', details: error.message });
   }
 });
 
-// Lyrics generation endpoint
+// ============================================================================
+// LYRICS GENERATION
+// ============================================================================
 app.post('/api/generate-lyrics', async (req, res) => {
   try {
     const { title, genre, mood, theme, language = 'de' } = req.body;
@@ -89,34 +199,19 @@ app.post('/api/generate-lyrics', async (req, res) => {
          Genre: ${genre}
          Stimmung: ${mood}
          ${theme ? `Thema: ${theme}` : ''}
-         
-         Der Song sollte:
-         - Verse, Chorus und Bridge haben
-         - Emotional und authentisch sein
-         - Zum Genre und zur Stimmung passen
-         
+         Der Song sollte Verse, Chorus und Bridge haben.
          Gib nur den Songtext aus, ohne weitere Erklärungen.`
       : `Write song lyrics for a song titled "${title}".
          Genre: ${genre}
          Mood: ${mood}
          ${theme ? `Theme: ${theme}` : ''}
-         
-         The song should:
-         - Have verses, chorus, and bridge
-         - Be emotional and authentic
-         - Match the genre and mood
-         
+         The song should have verses, chorus, and bridge.
          Provide only the lyrics, without additional explanations.`;
 
     const message = await anthropic.messages.create({
       model: 'claude-opus-4-1',
       max_tokens: 2048,
-      messages: [
-        {
-          role: 'user',
-          content: prompt,
-        },
-      ],
+      messages: [{ role: 'user', content: prompt }],
     });
 
     const content = message.content[0].type === 'text' ? message.content[0].text : '';
@@ -131,14 +226,13 @@ app.post('/api/generate-lyrics', async (req, res) => {
     });
   } catch (error) {
     console.error('Error generating lyrics:', error);
-    res.status(500).json({
-      error: 'Failed to generate lyrics',
-      details: error.message,
-    });
+    res.status(500).json({ error: 'Failed to generate lyrics', details: error.message });
   }
 });
 
-// Generic generate endpoint (proxies to Anthropic)
+// ============================================================================
+// GENERIC GENERATE (Anthropic Proxy for tool.html)
+// ============================================================================
 app.post('/api/generate', async (req, res) => {
   try {
     const { model, max_tokens, messages } = req.body;
@@ -165,14 +259,13 @@ app.post('/api/generate', async (req, res) => {
     });
   } catch (error) {
     console.error('Error in generate endpoint:', error);
-    res.status(500).json({
-      error: 'Failed to generate',
-      details: error.message,
-    });
+    res.status(500).json({ error: 'Failed to generate', details: error.message });
   }
 });
 
-// Generic message endpoint for future extensibility
+// ============================================================================
+// GENERIC MESSAGE
+// ============================================================================
 app.post('/api/message', async (req, res) => {
   try {
     const { messages, systemPrompt, maxTokens = 2048 } = req.body;
@@ -192,7 +285,6 @@ app.post('/api/message', async (req, res) => {
     }
 
     const message = await anthropic.messages.create(messageParams);
-
     const content = message.content[0].type === 'text' ? message.content[0].text : '';
 
     res.json({
@@ -205,10 +297,7 @@ app.post('/api/message', async (req, res) => {
     });
   } catch (error) {
     console.error('Error in message endpoint:', error);
-    res.status(500).json({
-      error: 'Failed to process message',
-      details: error.message,
-    });
+    res.status(500).json({ error: 'Failed to process message', details: error.message });
   }
 });
 
@@ -220,10 +309,7 @@ app.use((req, res) => {
 // Error handler
 app.use((err, req, res, next) => {
   console.error('Unhandled error:', err);
-  res.status(500).json({
-    error: 'Internal server error',
-    details: err.message,
-  });
+  res.status(500).json({ error: 'Internal server error', details: err.message });
 });
 
 app.listen(port, () => {
