@@ -1,4 +1,5 @@
 import express from 'express';
+import { setInterval } from 'timers';
 import cors from 'cors';
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
@@ -314,4 +315,36 @@ app.use((err, req, res, next) => {
 
 app.listen(port, () => {
   console.log(`SongCraft Backend running on port ${port}`);
+
+  // ============================================================================
+  // SUPABASE KEEP-ALIVE PING
+  // Verhindert automatisches Pausieren des Free-Tier Projekts
+  // Sendet alle 4 Tage einen Ping an Supabase
+  // ============================================================================
+  const SUPABASE_PING_URL = process.env.SUPABASE_URL;
+  const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'sb_publishable_u-kXysGRx4PYl9Abr2ZZmw_zg9W7XnIqMvhJLFpRoYbDsECeTuKAZGd';
+  const FOUR_DAYS_MS = 4 * 24 * 60 * 60 * 1000; // 4 Tage in Millisekunden
+
+  async function pingSupabase() {
+    const timestamp = new Date().toISOString();
+    try {
+      const response = await fetch(`${SUPABASE_PING_URL}/rest/v1/`, {
+        method: 'GET',
+        headers: {
+          'apikey': SUPABASE_ANON_KEY,
+          'Authorization': `Bearer ${SUPABASE_ANON_KEY}`
+        }
+      });
+      console.log(`[${timestamp}] ✅ Supabase Keep-Alive Ping: Status ${response.status}`);
+    } catch (error) {
+      console.error(`[${timestamp}] ❌ Supabase Ping Fehler:`, error.message);
+    }
+  }
+
+  // Sofort beim Start pingen
+  pingSupabase();
+
+  // Dann alle 4 Tage wiederholen
+  setInterval(pingSupabase, FOUR_DAYS_MS);
+  console.log('✅ Supabase Keep-Alive Ping aktiviert (alle 4 Tage)');
 });
