@@ -1,5 +1,4 @@
 import express from 'express';
-import { setInterval } from 'timers';
 import cors from 'cors';
 import crypto from 'crypto';
 import Anthropic from '@anthropic-ai/sdk';
