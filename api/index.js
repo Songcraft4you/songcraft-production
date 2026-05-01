@@ -16,10 +16,15 @@ const anthropic = new Anthropic({
 });
 
 // Initialize Supabase with Service Role Key (admin access, bypasses RLS)
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// Lazy initialization to avoid crash if env vars not set at startup
+function getSupabase() {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  if (!url || !key) {
+    throw new Error('SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set');
+  }
+  return createClient(url, key);
+}
 
 // Lemon Squeezy Plan Mapping: Variant ID -> plan_level
 const PLAN_MAP = {
@@ -91,6 +96,7 @@ app.post('/api/lemon-webhook', async (req, res) => {
       }
 
       // Update user profile in Supabase
+      const supabase = getSupabase();
       const { error: updateError } = await supabase
         .from('profiles')
         .update({ plan_level: planLevel, lemon_squeezy_id: lemonSqueezyId })
@@ -113,6 +119,7 @@ app.post('/api/lemon-webhook', async (req, res) => {
         return res.status(400).json({ error: 'No email in payload' });
       }
 
+      const supabase = getSupabase();
       const { error: downgradeError } = await supabase
         .from('profiles')
         .update({ plan_level: 0, lemon_squeezy_id: null })
