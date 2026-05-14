@@ -238,7 +238,8 @@ app.post('/api/generate-lyrics', async (req, res) => {
 });
 
 // ============================================================================
-// GENERIC GENERATE (Anthropic Proxy for tool.html)
+// GENERIC GENERATE (Anthropic Proxy for tool.html) — SSE Streaming
+// Uses Server-Sent Events to avoid Railway's 30s timeout on long generations
 // ============================================================================
 app.post('/api/generate', async (req, res) => {
   try {
@@ -248,25 +249,52 @@ app.post('/api/generate', async (req, res) => {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    const message = await anthropic.messages.create({
+    // Set SSE headers to keep connection alive during long generations
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.flushHeaders();
+
+    let fullText = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    const stream = anthropic.messages.stream({
       model: model || 'claude-opus-4-1',
       max_tokens: max_tokens || 8000,
       messages,
     });
 
-    const content = message.content.map(c => c.text || '').join('');
-
-    res.json({
-      success: true,
-      content: [{ type: 'text', text: content }],
-      usage: {
-        input_tokens: message.usage.input_tokens,
-        output_tokens: message.usage.output_tokens,
-      },
+    stream.on('text', (text) => {
+      fullText += text;
+      // Send each chunk to keep connection alive
+      res.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
     });
+
+    stream.on('message', (message) => {
+      inputTokens = message.usage?.input_tokens || 0;
+      outputTokens = message.usage?.output_tokens || 0;
+    });
+
+    await stream.finalMessage();
+
+    // Send final complete response
+    res.write(`data: ${JSON.stringify({
+      type: 'done',
+      success: true,
+      content: [{ type: 'text', text: fullText }],
+      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+    })}\n\n`);
+    res.end();
   } catch (error) {
     console.error('Error in generate endpoint:', error);
-    res.status(500).json({ error: 'Failed to generate', details: error.message });
+    try {
+      res.write(`data: ${JSON.stringify({ type: 'error', error: 'Failed to generate', details: error.message })}\n\n`);
+      res.end();
+    } catch (_) {
+      // Headers already sent
+    }
   }
 });
 
