@@ -253,29 +253,27 @@ app.post('/api/generate', async (req, res) => {
     let inputTokens = 0;
     let outputTokens = 0;
 
-    // Keep-alive: send periodic comments so Railway doesn't close the connection
-    // This works with both old (JSON) and new (SSE) frontend versions
-    const keepAliveInterval = setInterval(() => {
-      try { res.write(''); } catch(_) {}
-    }, 5000);
-
-    const stream = anthropic.messages.stream({
+    // Use Anthropic streaming internally to avoid Railway's 30s idle timeout.
+    // We collect all chunks and return a single JSON response at the end.
+    // The stream keeps the TCP connection active during generation.
+    const message = await anthropic.messages.create({
       model: model || 'claude-opus-4-1',
       max_tokens: max_tokens || 8000,
       messages,
+      stream: true,
     });
 
-    stream.on('text', (text) => {
-      fullText += text;
-    });
-
-    stream.on('message', (message) => {
-      inputTokens = message.usage?.input_tokens || 0;
-      outputTokens = message.usage?.output_tokens || 0;
-    });
-
-    await stream.finalMessage();
-    clearInterval(keepAliveInterval);
+    for await (const event of message) {
+      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
+        fullText += event.delta.text;
+      }
+      if (event.type === 'message_delta' && event.usage) {
+        outputTokens = event.usage.output_tokens || 0;
+      }
+      if (event.type === 'message_start' && event.message?.usage) {
+        inputTokens = event.message.usage.input_tokens || 0;
+      }
+    }
 
     // Return standard JSON response (compatible with all frontend versions)
     res.json({
