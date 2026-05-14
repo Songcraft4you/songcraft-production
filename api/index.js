@@ -249,16 +249,15 @@ app.post('/api/generate', async (req, res) => {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    // Set SSE headers to keep connection alive during long generations
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.flushHeaders();
-
     let fullText = '';
     let inputTokens = 0;
     let outputTokens = 0;
+
+    // Keep-alive: send periodic comments so Railway doesn't close the connection
+    // This works with both old (JSON) and new (SSE) frontend versions
+    const keepAliveInterval = setInterval(() => {
+      try { res.write(''); } catch(_) {}
+    }, 5000);
 
     const stream = anthropic.messages.stream({
       model: model || 'claude-opus-4-1',
@@ -268,8 +267,6 @@ app.post('/api/generate', async (req, res) => {
 
     stream.on('text', (text) => {
       fullText += text;
-      // Send each chunk to keep connection alive
-      res.write(`data: ${JSON.stringify({ type: 'delta', text })}\n\n`);
     });
 
     stream.on('message', (message) => {
@@ -278,23 +275,17 @@ app.post('/api/generate', async (req, res) => {
     });
 
     await stream.finalMessage();
+    clearInterval(keepAliveInterval);
 
-    // Send final complete response
-    res.write(`data: ${JSON.stringify({
-      type: 'done',
+    // Return standard JSON response (compatible with all frontend versions)
+    res.json({
       success: true,
       content: [{ type: 'text', text: fullText }],
       usage: { input_tokens: inputTokens, output_tokens: outputTokens },
-    })}\n\n`);
-    res.end();
+    });
   } catch (error) {
     console.error('Error in generate endpoint:', error);
-    try {
-      res.write(`data: ${JSON.stringify({ type: 'error', error: 'Failed to generate', details: error.message })}\n\n`);
-      res.end();
-    } catch (_) {
-      // Headers already sent
-    }
+    res.status(500).json({ error: 'Failed to generate', details: error.message });
   }
 });
 
