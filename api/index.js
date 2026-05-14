@@ -238,8 +238,89 @@ app.post('/api/generate-lyrics', async (req, res) => {
 });
 
 // ============================================================================
-// GENERIC GENERATE (Anthropic Proxy for tool.html) — SSE Streaming
-// Uses Server-Sent Events to avoid Railway's 30s timeout on long generations
+// AUTH HELPER — Verifies Supabase JWT and returns user profile
+// ============================================================================
+async function verifyAndGetProfile(req) {
+  const authHeader = req.headers['authorization'];
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return { error: 'UNAUTHORIZED', message: 'Kein Login-Token gefunden. Bitte einloggen.' };
+  }
+  const token = authHeader.slice(7);
+  const supabase = getSupabase();
+
+  // Verify the JWT with Supabase
+  const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+  if (authError || !user) {
+    return { error: 'UNAUTHORIZED', message: 'Ungültiger oder abgelaufener Login. Bitte neu einloggen.' };
+  }
+
+  // Fetch user profile (plan_level, free_credits_used)
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('plan_level, free_credits_used, email')
+    .eq('id', user.id)
+    .single();
+
+  if (profileError || !profile) {
+    // Profile might not exist yet — create it with defaults
+    const { data: newProfile, error: insertError } = await supabase
+      .from('profiles')
+      .insert({ id: user.id, email: user.email, plan_level: 0, free_credits_used: 0 })
+      .select('plan_level, free_credits_used, email')
+      .single();
+    if (insertError) {
+      return { error: 'DB_ERROR', message: 'Datenbankfehler beim Laden des Profils.' };
+    }
+    return { user, profile: newProfile };
+  }
+
+  return { user, profile };
+}
+
+// ============================================================================
+// PLAN CHECK HELPER — Returns error if user is not allowed to generate
+// Level 0 (Explorer): 1 free generation, then blocked
+// Level 1+ (paid): unlimited
+// ============================================================================
+const FREE_GENERATION_LIMIT = 1;
+
+async function checkAndConsumeCredit(userId, profile) {
+  const supabase = getSupabase();
+  const planLevel = profile.plan_level || 0;
+  const creditsUsed = profile.free_credits_used || 0;
+
+  // Paid plans — always allowed
+  if (planLevel >= 1) {
+    return { allowed: true };
+  }
+
+  // Explorer (Level 0) — check free credit
+  if (creditsUsed >= FREE_GENERATION_LIMIT) {
+    return {
+      allowed: false,
+      error: 'NO_CREDITS',
+      message: `Dein kostenloses Kontingent ist aufgebraucht. Upgrade auf Genesis oder Studio Elite um weiter zu generieren.`,
+      upgradeUrl: 'https://songcraft4you.com/pricing'
+    };
+  }
+
+  // Consume the free credit
+  const { error: updateError } = await supabase
+    .from('profiles')
+    .update({ free_credits_used: creditsUsed + 1 })
+    .eq('id', userId);
+
+  if (updateError) {
+    console.error('Credit update error:', updateError);
+    // Allow anyway to not block the user on DB errors
+  }
+
+  return { allowed: true, creditsRemaining: FREE_GENERATION_LIMIT - creditsUsed - 1 };
+}
+
+// ============================================================================
+// GENERIC GENERATE (Anthropic Proxy for tool.html) — with Auth + Plan Check
+// Uses internal Anthropic streaming to avoid Railway's 30s idle timeout
 // ============================================================================
 app.post('/api/generate', async (req, res) => {
   try {
@@ -249,37 +330,171 @@ app.post('/api/generate', async (req, res) => {
       return res.status(400).json({ error: 'messages array is required' });
     }
 
-    let fullText = '';
-    let inputTokens = 0;
-    let outputTokens = 0;
+    // —— AUTH CHECK ——
+    const authResult = await verifyAndGetProfile(req);
+    if (authResult.error) {
+      return res.status(401).json({ error: authResult.error, message: authResult.message });
+    }
+    const { user, profile } = authResult;
 
-    // Use Anthropic streaming internally to avoid Railway's 30s idle timeout.
-    // We collect all chunks and return a single JSON response at the end.
-    // The stream keeps the TCP connection active during generation.
-    const message = await anthropic.messages.create({
-      model: model || 'claude-opus-4-1',
-      max_tokens: max_tokens || 8000,
-      messages,
-      stream: true,
-    });
-
-    for await (const event of message) {
-      if (event.type === 'content_block_delta' && event.delta?.type === 'text_delta') {
-        fullText += event.delta.text;
-      }
-      if (event.type === 'message_delta' && event.usage) {
-        outputTokens = event.usage.output_tokens || 0;
-      }
-      if (event.type === 'message_start' && event.message?.usage) {
-        inputTokens = event.message.usage.input_tokens || 0;
-      }
+    // —— PLAN CHECK ——
+    const creditResult = await checkAndConsumeCredit(user.id, profile);
+    if (!creditResult.allowed) {
+      return res.status(403).json({
+        error: creditResult.error,
+        message: creditResult.message,
+        upgradeUrl: creditResult.upgradeUrl
+      });
     }
 
-    // Return standard JSON response (compatible with all frontend versions)
+    const planLevel = profile.plan_level || 0;
+    console.log(`✅ Generate: user=${profile.email}, plan=${planLevel}, creditsRemaining=${creditResult.creditsRemaining ?? 'unlimited'}`);
+
+    // ============================================================
+    // ROUTING WEICHE: Plan-Level bestimmt die Engine
+    // Level 0 (Explorer):     Haiku + Haiku  (Recursive Light)
+    // Level 1 (Genesis):      Sonnet One-Shot (High Quality)
+    // Level 2 (Studio Elite): Haiku + Sonnet  (Full Recursive DNA)
+    // ============================================================
+
+    // Helper: run a single Anthropic call with internal streaming
+    async function runClaude(mdl, maxTok, msgs) {
+      let text = '';
+      let inTok = 0, outTok = 0;
+      const stream = await anthropic.messages.create({
+        model: mdl,
+        max_tokens: maxTok,
+        messages: msgs,
+        stream: true,
+      });
+      for await (const ev of stream) {
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') text += ev.delta.text;
+        if (ev.type === 'message_start' && ev.message?.usage) inTok = ev.message.usage.input_tokens || 0;
+        if (ev.type === 'message_delta' && ev.usage) outTok = ev.usage.output_tokens || 0;
+      }
+      return { text, inTok, outTok };
+    }
+
+    // Helper: extract content between tags, fallback to full text
+    function extractTag(text, tag) {
+      const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)<\/${tag}>`, 'i'));
+      return m ? m[1].trim() : text.trim();
+    }
+
+    let finalText = '';
+    let totalIn = 0, totalOut = 0;
+    let engineLog = '';
+
+    if (planLevel === 1) {
+      // ── GENESIS: One-Shot mit Sonnet ──────────────────────────
+      const r = await runClaude('claude-sonnet-4-5', max_tokens || 4000, messages);
+      finalText = r.text;
+      totalIn = r.inTok; totalOut = r.outTok;
+      engineLog = 'Genesis One-Shot Engine (Claude Sonnet)';
+
+    } else if (planLevel >= 2) {
+      // ── STUDIO ELITE: Full Recursive DNA (Haiku → Sonnet) ────
+      // STEP 1+2: DRAFT + AUDIT via Haiku
+      const draftPrompt = [
+        ...messages,
+        { role: 'assistant', content: '' }
+      ];
+      // Remove empty assistant message, just use original messages for draft
+      const draft = await runClaude('claude-haiku-4-5', 3000, messages);
+      totalIn += draft.inTok; totalOut += draft.outTok;
+      const draftText = draft.text;
+
+      // 2.5s pause to avoid rate limit
+      await new Promise(r => setTimeout(r, 2500));
+
+      // STEP 2: AUDIT — Haiku als feindseliger Kritiker
+      const auditMessages = [
+        {
+          role: 'user',
+          content: `Du bist ein gnadenloser Musik-Kritiker. Analysiere diesen Song-Entwurf und finde EXAKT 3 Schwachstellen. Sei scharf und präzise. Gib einen Score von 1-10 (ein guter Auditor gibt nie über 5).
+
+Entwurf:
+${draftText}
+
+Format:
+<audit>
+Schwachstelle 1: [Beschreibung]
+Schwachstelle 2: [Beschreibung]
+Schwachstelle 3: [Beschreibung]
+Score: [X]/10
+</audit>`
+        }
+      ];
+      const audit = await runClaude('claude-haiku-4-5', 1000, auditMessages);
+      totalIn += audit.inTok; totalOut += audit.outTok;
+      const auditText = extractTag(audit.text, 'audit');
+
+      // 2.5s pause
+      await new Promise(r => setTimeout(r, 2500));
+
+      // STEP 3+4: REFINEMENT + BLUEPRINT via Sonnet
+      const originalUserMsg = messages[messages.length - 1]?.content || '';
+      const refinementMessages = [
+        {
+          role: 'user',
+          content: `Du bist ein Elite-Song-Engineer. Du erhältst einen Roh-Entwurf und einen Kritik-Bericht.
+
+Original-Anfrage: ${originalUserMsg}
+
+Roh-Entwurf:
+${draftText}
+
+Kritik-Bericht (3 Schwachstellen die du eliminieren MUSST):
+${auditText}
+
+Deine Aufgabe:
+1. Rekonstruiere den Song komplett neu
+2. Eliminiere alle 3 Schwachstellen
+3. Injiziere Resonanz-Engineering (Vocal Fry, Micro-Tremolo, Solfeggio-Frequenzen wie 528Hz, 432Hz)
+4. Gib das Ergebnis in <output> Tags aus
+5. Gib eine kurze Engineering-Zusammenfassung in <engineering_log> Tags aus (was wurde verbessert)
+
+Liefere ein produktionsfertiges Ergebnis.`
+        }
+      ];
+      const refined = await runClaude('claude-sonnet-4-5', max_tokens || 4000, refinementMessages);
+      totalIn += refined.inTok; totalOut += refined.outTok;
+
+      finalText = extractTag(refined.text, 'output') || refined.text;
+      engineLog = extractTag(refined.text, 'engineering_log') || `3 Schwachstellen eliminiert. Solfeggio-Frequenzen kalibriert.`;
+
+    } else {
+      // ── EXPLORER: Recursive Light (Haiku + Haiku) ────────────
+      const draft = await runClaude('claude-haiku-4-5', 2000, messages);
+      totalIn += draft.inTok; totalOut += draft.outTok;
+      const draftText = draft.text;
+
+      // 2.5s pause
+      await new Promise(r => setTimeout(r, 2500));
+
+      // Light Audit + Refinement in einem Haiku-Call
+      const refineMessages = [
+        {
+          role: 'user',
+          content: `Verbessere diesen Song-Entwurf. Finde die 2 größten Schwächen und eliminiere sie. Gib nur das verbesserte Ergebnis aus.
+
+Entwurf:
+${draftText}`
+        }
+      ];
+      const refined = await runClaude('claude-haiku-4-5', 2000, refineMessages);
+      totalIn += refined.inTok; totalOut += refined.outTok;
+      finalText = refined.text;
+      engineLog = 'Explorer Recursive Light Engine';
+    }
+
+    // Return standard JSON response
     res.json({
       success: true,
-      content: [{ type: 'text', text: fullText }],
-      usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      content: [{ type: 'text', text: finalText }],
+      engineering_log: engineLog,
+      plan_level: planLevel,
+      usage: { input_tokens: totalIn, output_tokens: totalOut },
     });
   } catch (error) {
     console.error('Error in generate endpoint:', error);
